@@ -321,6 +321,16 @@ def density_cascade_phase1(
                 ceiling=ceiling,
             )
             thresholds_list = list(range(ceiling, floor - 1, -1))
+            import os as _os
+            print(
+                "[auto-params] cascade auto thresholds: ceiling=%d floor=%d "
+                "(n_tx_pool=%d)" % (ceiling, floor, int(grid_v.sum())), flush=True)
+            _force = _os.environ.get("TRACER_FORCE_CASCADE_THRESHOLDS")
+            if _force:   # test hook: "ceiling,floor" taken from a full-slide run
+                _c, _f = (int(v) for v in _force.split(","))
+                thresholds_list = list(range(_c, _f - 1, -1))
+                print(
+                    "[auto-params] FORCED cascade thresholds %d..%d" % (_c, _f), flush=True)
     else:
         thresholds_list = list(thresholds)
 
@@ -494,6 +504,15 @@ def cascade_as_residual_handler(
 
     new_labels = df_out[entity_col].to_numpy(dtype=object).copy()
     relabeled_orig_indices: list[int] = []
+    # Name each anchor by what it is (threshold, hot bin), not by creation
+    # order. The creation counter is a slide-wide quantity, so labels (and
+    # everything that tie-breaks on label order, e.g. Rescue's entity-id
+    # rule) would depend on what else is in the input. (threshold, hot_bin)
+    # is unique per anchor: each hot bin is visited once per threshold pass.
+    def _anchor_name(a):
+        bx, by = a["hot_bin"]
+        return (f"{a['threshold']}_{bx}_{by}").replace("-", "m")
+    _anchor_names = [_anchor_name(a) for a in casc["anchors"]]
     for res_idx, anchor_idx in casc["tx_to_anchor"].items():
         orig_idx = df_res["_orig_idx"].iloc[res_idx]
         new_labels[orig_idx] = f"{label_prefix}{_anchor_names[anchor_idx]}-1"
@@ -504,15 +523,6 @@ def cascade_as_residual_handler(
     # are emitted as `cascade_<n>-1` and classified as ``partial`` —
     # downstream rerank/reassign machinery treats them symmetrically
     # with Phase-1c partials.
-    # Name each anchor by what it is (threshold, hot bin), not by creation
-    # order. The creation counter is a slide-wide quantity, so labels (and
-    # everything that tie-breaks on label order, e.g. Rescue's entity-id
-    # rule) would depend on what else is in the input. (threshold, hot_bin)
-    # is unique per anchor: each hot bin is visited once per threshold pass.
-    def _anchor_name(a):
-        bx, by = a["hot_bin"]
-        return (f"{a['threshold']}_{bx}_{by}").replace("-", "m")
-    _anchor_names = [_anchor_name(a) for a in casc["anchors"]]
     if "_etype" in df_out.columns and relabeled_orig_indices:
         mask = np.zeros(len(df_out), dtype=bool)
         mask[relabeled_orig_indices] = True

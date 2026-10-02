@@ -1428,6 +1428,18 @@ def _record_stage(progression: list, stage_name: str, df: pd.DataFrame, col: str
         **_state_dict(df, col),
     }
     progression.append(entry)
+    _dump_dir = _os.environ.get("TRACER_DUMP_DIR")   # test hook: per-stage label dump
+    if _dump_dir:
+        import re as _re
+        _os.makedirs(_dump_dir, exist_ok=True)
+        _safe = _re.sub(r"[^A-Za-z0-9]+", "_", stage_name).strip("_")
+        _d = pd.DataFrame({
+            "transcript_id": df["transcript_id"].to_numpy(),
+            "label": df[col].astype(str).to_numpy(),
+        })
+        if "_etype" in df.columns:
+            _d["etype"] = df["_etype"].astype(str).to_numpy()
+        _d.to_parquet(_os.path.join(_dump_dir, f"{len(progression):02d}_{_safe}.parquet"), index=False)
     if _os.environ.get("TRACER_STAGE_VERBOSE"):
         tag = _os.environ.get("TRACER_STAGE_TAG", "")
         prefix = f"[stage {tag}]" if tag else "[stage]"
@@ -1629,6 +1641,13 @@ def run_segmented_pipeline(df: pd.DataFrame,
         auto_Gz = 1.0
     if not np.isfinite(auto_Gz):
         auto_Gz = 1.0
+    import os as _os
+    print("[auto-params] within-cell dz threshold=%s recommended G_z=%s" % (
+             auto_dz, auto_Gz), flush=True)
+    _fgz = _os.environ.get("TRACER_FORCE_AUTO_GZ")   # test hook
+    if _fgz:
+        auto_Gz = float(_fgz)
+        print("[auto-params] FORCED auto_Gz=%s" % auto_Gz, flush=True)
 
     # Stage 1 — Prune (nuclear-seed when overlaps_nucleus is available).
     # Use PMI column when available; nuclear-seed identity prune
@@ -1864,6 +1883,22 @@ def run_segmented_pipeline(df: pd.DataFrame,
     # Post-Group Rescue (opt-in). Admits any remaining "-1" tx to
     # Phase-1 entities AND Group components — closing the gap where
     # Group's UNASSIGNED_* couldn't be Rescue targets in the main pass.
+    _perm_seed = _os.environ.get("TRACER_PERMUTE_CASCADE_LABELS")   # test hook
+    if _perm_seed and cfg.rescue.post_group_passes > 0:
+        # Rename cascade_<n>-... partials by a random permutation of n. Pure
+        # renaming: geometry and membership are untouched.
+        _lab = df_grouped["tracer_id"].astype(str)
+        _mm = _lab.str.extract(r"^cascade_(\d+)(-.*)$")
+        _isc = _mm[0].notna()
+        _nn = _mm.loc[_isc, 0].astype(np.int64)
+        _ns = np.unique(_nn.to_numpy())
+        _newn = np.random.default_rng(int(_perm_seed)).permutation(_ns)
+        _map = dict(zip(_ns.tolist(), _newn.tolist()))
+        _lab = _lab.copy()
+        _lab.loc[_isc] = "cascade_" + _nn.map(_map).astype(str) + _mm.loc[_isc, 1]
+        df_grouped = df_grouped.copy()
+        df_grouped["tracer_id"] = _lab.to_numpy()
+        print("[perm-test] renamed %d cascade labels" % len(_ns), flush=True)
     if cfg.rescue.post_group_passes > 0:
         _set_admit_independent(cfg.rescue.admit_independent)
         for _pass in range(cfg.rescue.post_group_passes):
