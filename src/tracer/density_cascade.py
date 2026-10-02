@@ -496,7 +496,7 @@ def cascade_as_residual_handler(
     relabeled_orig_indices: list[int] = []
     for res_idx, anchor_idx in casc["tx_to_anchor"].items():
         orig_idx = df_res["_orig_idx"].iloc[res_idx]
-        new_labels[orig_idx] = f"{label_prefix}{anchor_idx}-1"
+        new_labels[orig_idx] = f"{label_prefix}{_anchor_names[anchor_idx]}-1"
         relabeled_orig_indices.append(int(orig_idx))
     df_out[entity_col] = new_labels
 
@@ -504,6 +504,15 @@ def cascade_as_residual_handler(
     # are emitted as `cascade_<n>-1` and classified as ``partial`` —
     # downstream rerank/reassign machinery treats them symmetrically
     # with Phase-1c partials.
+    # Name each anchor by what it is (threshold, hot bin), not by creation
+    # order. The creation counter is a slide-wide quantity, so labels (and
+    # everything that tie-breaks on label order, e.g. Rescue's entity-id
+    # rule) would depend on what else is in the input. (threshold, hot_bin)
+    # is unique per anchor: each hot bin is visited once per threshold pass.
+    def _anchor_name(a):
+        bx, by = a["hot_bin"]
+        return (f"{a['threshold']}_{bx}_{by}").replace("-", "m")
+    _anchor_names = [_anchor_name(a) for a in casc["anchors"]]
     if "_etype" in df_out.columns and relabeled_orig_indices:
         mask = np.zeros(len(df_out), dtype=bool)
         mask[relabeled_orig_indices] = True
