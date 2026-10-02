@@ -22,12 +22,15 @@ References:
 """
 from __future__ import annotations
 
+import logging
 from collections import Counter, defaultdict
 from typing import Optional, Sequence
 
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
+
+_log = logging.getLogger("tracer.density_cascade")
 
 # NOTE: `build_dense_pmi_matrix_small_panel` is intentionally NOT imported at module
 # level — that path is a fallback used only when callers invoke
@@ -86,6 +89,93 @@ def _build_grid(df: pd.DataFrame, G: float = 2.0,
     grid = np.zeros((n_y, n_x), dtype=np.int32)
     np.add.at(grid, (by, bx), 1)
     return grid, (float(x_min), float(y_min), float(x_max), float(y_max))
+
+
+def bin_counts_abs(x: np.ndarray, y: np.ndarray, G: float = 2.0,
+                   ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Per-bin transcript counts on ABSOLUTE bins ``floor(coord / G)``.
+
+    These are the same bins the cascade itself uses (``bin_x = floor(x / G)``),
+    and they do not depend on which transcripts are present, so counts from
+    disjoint spatial pieces of one slide can simply be added together (see
+    ``merge_bin_counts``). Returns ``(bx, by, count)`` with one entry per
+    occupied bin.
+    """
+    bx = np.floor(np.asarray(x, dtype=np.float32) / G).astype(np.int64)
+    by = np.floor(np.asarray(y, dtype=np.float32) / G).astype(np.int64)
+    if bx.size == 0:
+        e = np.zeros(0, dtype=np.int64)
+        return e, e.copy(), e.copy()
+    off_x, off_y = int(bx.min()), int(by.min())
+    span_y = int(by.max()) - off_y + 1
+    key = (bx - off_x) * span_y + (by - off_y)
+    uk, cnt = np.unique(key, return_counts=True)
+    return ((uk // span_y) + off_x).astype(np.int64), \
+           ((uk % span_y) + off_y).astype(np.int64), cnt.astype(np.int64)
+
+
+def merge_bin_counts(parts) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Sum ``(bx, by, count)`` triples from several pieces of one slide."""
+    parts = [p for p in parts if len(p[0])]
+    if not parts:
+        e = np.zeros(0, dtype=np.int64)
+        return e, e.copy(), e.copy()
+    bx = np.concatenate([p[0] for p in parts])
+    by = np.concatenate([p[1] for p in parts])
+    cn = np.concatenate([p[2] for p in parts])
+    off_x, off_y = int(bx.min()), int(by.min())
+    span_y = int(by.max()) - off_y + 1
+    key = (bx - off_x) * span_y + (by - off_y)
+    uk, inv = np.unique(key, return_inverse=True)
+    tot = np.zeros(len(uk), dtype=np.int64)
+    np.add.at(tot, inv, cn)
+    return ((uk // span_y) + off_x).astype(np.int64), \
+           ((uk % span_y) + off_y).astype(np.int64), tot
+
+
+def cascade_thresholds_from_bin_counts(
+    bx: np.ndarray, by: np.ndarray, cnt: np.ndarray, *,
+    territory_radius_bins: int = 1,
+    target_cov: float = 0.65,
+    hard_min: int = 2,
+    ceiling: Optional[int] = None,
+) -> tuple[int, int, list]:
+    """Cascade ``(ceiling, floor, coverage_curve)`` from per-bin counts.
+
+    Identical to deriving the thresholds from the residual pool of a whole
+    slide, and therefore computable once from counts merged across patches.
+    ``ceiling`` defaults to the densest bin. Returns ``(0, hard_min, [])`` for
+    an empty pool.
+    """
+    if len(bx) == 0:
+        return 0, int(hard_min), []
+    off_x, off_y = int(bx.min()), int(by.min())
+    grid = np.zeros((int(by.max()) - off_y + 1, int(bx.max()) - off_x + 1),
+                    dtype=np.int32)
+    grid[by - off_y, bx - off_x] = cnt
+    ceil = int(ceiling) if ceiling is not None else int(grid.max())
+    floor, curve = auto_floor_from_coverage(
+        grid, target_cov=target_cov, R=territory_radius_bins,
+        hard_min=hard_min, ceiling=ceil)
+    return ceil, int(floor), curve
+
+
+def residual_pool_bin_counts(
+    df_rescued: pd.DataFrame, aux: dict, *, entity_col: str = "tracer_id",
+    G: float = 2.0, keep: Optional[np.ndarray] = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Bin counts of the Group-cascade pool: unassigned (``"-1"``) transcripts
+    whose gene is in the PMI vocabulary. ``keep`` (bool array over rows)
+    restricts to a subset, e.g. the core of a patch, so patches do not double
+    count their overlap.
+    """
+    is_res = (df_rescued[entity_col].astype(str) == "-1").to_numpy()
+    g2i = aux["gene_to_idx"]
+    valid = df_rescued["feature_name"].isin(list(g2i)).to_numpy(dtype=bool)
+    m = is_res & valid
+    if keep is not None:
+        m &= np.asarray(keep, dtype=bool)
+    return bin_counts_abs(df_rescued["x"].to_numpy()[m], df_rescued["y"].to_numpy()[m], G)
 
 
 def _moore_dilate(mask: np.ndarray, R: int = 1) -> np.ndarray:
@@ -311,26 +401,20 @@ def density_cascade_phase1(
         if not valid_mask.any():
             thresholds_list: list[int] = []
         else:
-            df_valid = df.loc[valid_mask]
-            grid_v, _ = _build_grid(df_valid, G=G)
-            ceiling = (auto_ceiling if auto_ceiling is not None
-                          else int(grid_v.max()))
-            floor, coverage_curve_diag = auto_floor_from_coverage(
-                grid_v, target_cov=auto_target_cov,
-                R=territory_radius_bins, hard_min=auto_hard_min,
-                ceiling=ceiling,
-            )
+            # Counts on absolute bins (not relative to this input's minimum
+            # coordinate), so the result is the same whether this input is a
+            # whole slide or the merged residual pool of its patches.
+            _bx, _by, _cnt = bin_counts_abs(coords[valid_mask, 0],
+                                            coords[valid_mask, 1], G)
+            ceiling, floor, coverage_curve_diag = \
+                cascade_thresholds_from_bin_counts(
+                    _bx, _by, _cnt,
+                    territory_radius_bins=territory_radius_bins,
+                    target_cov=auto_target_cov, hard_min=auto_hard_min,
+                    ceiling=auto_ceiling)
             thresholds_list = list(range(ceiling, floor - 1, -1))
-            import os as _os
-            print(
-                "[auto-params] cascade auto thresholds: ceiling=%d floor=%d "
-                "(n_tx_pool=%d)" % (ceiling, floor, int(grid_v.sum())), flush=True)
-            _force = _os.environ.get("TRACER_FORCE_CASCADE_THRESHOLDS")
-            if _force:   # test hook: "ceiling,floor" taken from a full-slide run
-                _c, _f = (int(v) for v in _force.split(","))
-                thresholds_list = list(range(_c, _f - 1, -1))
-                print(
-                    "[auto-params] FORCED cascade thresholds %d..%d" % (_c, _f), flush=True)
+            _log.info("cascade auto thresholds: ceiling=%d floor=%d "
+                      "(pool=%d tx)", ceiling, floor, int(_cnt.sum()))
     else:
         thresholds_list = list(thresholds)
 
@@ -347,7 +431,14 @@ def density_cascade_phase1(
     # Pool = currently uncommitted, valid-gene tx
     pool: set[int] = set(np.where(valid_mask)[0].tolist())
     bin_pool_count: Counter = Counter()
-    for i in pool:
+    # Visit pool members in ascending row order so the dict's insertion order
+    # (= the tie order for equal-density bins below) is "bin whose earliest
+    # transcript comes first in the input". Iterating the set directly gave the
+    # same order only while its hash table was larger than the largest row
+    # index, i.e. it was an accident of the set size; this makes it a rule.
+    # Relative row order is preserved in a spatial patch, so a patch visits
+    # equal-density bins in the same order as the whole slide.
+    for i in sorted(pool):
         bin_pool_count[bin_keys[i]] += 1
 
     anchors: list[dict] = []
@@ -362,7 +453,9 @@ def density_cascade_phase1(
     for t in thresholds_list:
         hot = [(b, bin_pool_count[b]) for b in bin_pool_count
                if bin_pool_count[b] >= t]
-        # Sort by density desc — higher density wins contests
+        # Sort by density desc — higher density wins contests. The sort is
+        # stable, so equal-density bins stay in bin_pool_count's insertion
+        # order (earliest transcript first; see above).
         hot.sort(key=lambda x: -x[1])
 
         n_seeded_pass = 0
