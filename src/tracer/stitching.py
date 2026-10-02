@@ -1171,22 +1171,18 @@ def stitch_entities_hierarchical(
             bz_arr = np.floor(
                 transcript_coords[valid, 2] / float(G_z)
             ).astype(np.int64)
-            bin_keys = list(zip(xy_keys.tolist(), bz_arr.tolist()))
-        else:
-            bin_keys = xy_keys.tolist()
 
-        bin_to_comps = defaultdict(set)
-        # Per-(bin, entity) tx counts so we can weight candidate edges
-        # by the supporting tx-tx pair count for the optional
-        # min_candidate_edges filter. Same memory order as bin_to_comps.
-        bin_to_comp_counts: dict = defaultdict(lambda: defaultdict(int))
-        for bk, c in zip(bin_keys, comp_codes.tolist()):
-            bin_to_comps[bk].add(c)
-            bin_to_comp_counts[bk][c] += 1
-        # Total tx per entity (for min_candidate_edges='min' mode)
-        entity_tx_total: dict[int, int] = defaultdict(int)
-        for c in comp_codes.tolist():
-            entity_tx_total[c] += 1
+        # (The former per-transcript Python dicts bin_to_comps /
+        # bin_to_comp_counts were write-only and dominated Stitch RAM;
+        # candidate enumeration below uses the vectorised bc_df tables.)
+
+        # Total tx per entity (for min_candidate_edges='min' mode). Built
+        # with np.unique instead of a per-transcript Python loop; the
+        # defaultdict keeps the original semantics for missing keys.
+        _ent_u, _ent_n = np.unique(comp_codes, return_counts=True)
+        entity_tx_total: dict[int, int] = defaultdict(
+            int, zip(_ent_u.tolist(), _ent_n.tolist()))
+        del _ent_u, _ent_n
 
         # Half-neighborhood directions in xy. "0" → empty (same-bin pairs only).
         # "4" / "8" — orthogonal-only / full Moore-1 (24 → 8 raw offsets / 4 half).
@@ -1538,9 +1534,6 @@ def stitch_entities_hierarchical(
             candidate_pairs = kept3
 
         edges = list(candidate_pairs)
-
-        # Indices are no longer needed after initial enumeration; release memory.
-        del bin_to_comps
     _phase("candidate_enum")
 
     # cluster metadata tracked at DSU roots
@@ -2680,12 +2673,22 @@ def apply_stitching_to_transcripts_memory_efficient(
         # Map each transcript's entity string to its row index in summary_df.
         entity_id_arr = summary["entity_id"].astype(str).to_numpy()
         entity_to_idx = {eid: i for i, eid in enumerate(entity_id_arr)}
-        ent_str = df_final[entity_col].astype(str).to_numpy()
-        transcript_entity_codes = np.fromiter(
-            (entity_to_idx.get(e, -1) for e in ent_str),
-            dtype=np.int64,
-            count=len(ent_str),
+        # Factorize once (O(N) in C) and map only the unique labels through
+        # str -> summary row, instead of a 134M-element object-string array
+        # plus a Python-level dict lookup per transcript. Reused below for
+        # the per-entity tx counts.
+        _fcodes, _funiq = pd.factorize(df_final[entity_col], sort=False)
+        _funiq_str = pd.Index(_funiq).astype(str)
+        _lut = np.fromiter(
+            (entity_to_idx.get(e, -1) for e in _funiq_str),
+            dtype=np.int64, count=len(_funiq_str),
         )
+        # factorize codes NaN as -1; the original str-based path looked up
+        # the literal 'nan' (absent from summary -> -1), so both give -1.
+        transcript_entity_codes = np.where(
+            _fcodes >= 0, _lut[np.maximum(_fcodes, 0)], -1
+        ).astype(np.int64)
+        _fcounts = np.bincount(_fcodes[_fcodes >= 0], minlength=len(_funiq_str))
         if G_z is not None and len(coord_cols) >= 3:
             transcript_coords = df_final[
                 [coord_cols[0], coord_cols[1], coord_cols[2]]
@@ -2708,9 +2711,17 @@ def apply_stitching_to_transcripts_memory_efficient(
     # Per-entity tx count for the multi-partial merger tiebreak rule
     # in stitch_entities_hierarchical (majority-tx-count when suffix
     # levels tie). One O(N) value_counts pass over the entity column.
-    entity_n_tx_dict = (
-        df_final[entity_col].astype(str).value_counts().to_dict()
-    )
+    if candidate_source == "grid":
+        # Counts already available from the factorize pass above.
+        entity_n_tx_dict = dict(zip(_funiq_str.tolist(), _fcounts.tolist()))
+        _n_nan = int((_fcodes < 0).sum())
+        if _n_nan:
+            entity_n_tx_dict["nan"] = entity_n_tx_dict.get("nan", 0) + _n_nan
+        del _fcodes, _funiq, _funiq_str, _lut, _fcounts
+    else:
+        entity_n_tx_dict = (
+            df_final[entity_col].astype(str).value_counts().to_dict()
+        )
 
     # When the K≥2 strict spatial gate OR the Mahalanobis rescue is
     # requested, compute per-entity tx-coord arrays. Cheap groupby-by-
