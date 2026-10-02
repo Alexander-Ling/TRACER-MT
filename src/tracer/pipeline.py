@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -1587,32 +1588,47 @@ def _resolve_pipeline_cfg(cfg):
     )
 
 
-def run_segmented_pipeline(df: pd.DataFrame,
-                           npmi_panel: pd.DataFrame,
-                           cfg=None,
-                           ) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
-    """Run the segmented workflow on ``df`` (must have ``cell_id`` set).
+@dataclass(frozen=True)
+class GlobalParams:
+    """Slide-wide values that a spatial patch must NOT re-derive from its own
+    (partial) data, so that processing a patch gives the same per-transcript
+    result as processing the whole slide.
+
+    ``cascade_thresholds``: descending bin-density thresholds for the Group
+        cascade (``list(range(ceiling, floor - 1, -1))``). ``None`` derives
+        them from the data passed in (whole-slide behaviour).
+    ``auto_Gz``: recommended z-bin size from ``estimate_within_cell_dz_threshold``.
+        ``None`` estimates it from the data passed in. It is only consumed when
+        ``stitch.g_z_um`` is not explicit or ``overlaps_nucleus`` is missing.
+    """
+    cascade_thresholds: Optional[tuple] = None
+    auto_Gz: Optional[float] = None
+
+
+def segmented_phase_a(df: pd.DataFrame,
+                      npmi_panel: pd.DataFrame,
+                      cfg=None,
+                      global_params: Optional[GlobalParams] = None,
+                      ) -> dict[str, Any]:
+    """Phase A of the segmented workflow: input -> Prune -> Phase 1 -> Rescue.
+
+    Returns the state ``segmented_phase_b`` needs: ``df_rescued``, ``aux``,
+    ``cfg``, ``progression``, ``input_cell_id`` and ``auto_Gz``. Everything in
+    phase A is local to a transcript's neighbourhood, so a spatial patch gives
+    the same result as the whole slide for transcripts well inside the patch.
 
     Parameters
     ----------
     df, npmi_panel
         Input transcripts (with ``cell_id``) and bootstrap PMI panel.
     cfg : PipelineConfig | None, optional
-        Phase-B config. When ``None`` (default), a `PipelineConfig` is
-        built from the current module-global constants so today's
-        production behavior is preserved bit-exactly (see
-        `_resolve_pipeline_cfg`). When provided, drives the Rescue,
-        Stitch, Demote, and Final Rescue call sites. Knobs not yet in
-        `PipelineConfig` (Phase-1 prune, Group, post-group-pass-count)
-        continue to read from module globals.
-
-    Returns
-    -------
-    df_final : DataFrame with a ``tracer_id`` column carrying the final per-tx
-        label (the legacy ``stitched`` column has been dropped / canonicalized
-        to ``tracer_id``).
-    stage_progression : list of state dicts, one per stage.
+        Config. When ``None`` (default), a `PipelineConfig` is built from
+        the current module-global constants so today's production behavior
+        is preserved bit-exactly (see `_resolve_pipeline_cfg`).
+    global_params : GlobalParams | None, optional
+        ``auto_Gz`` supplied here replaces the per-input estimate.
     """
+    global_params = global_params or GlobalParams()
     cfg = _resolve_pipeline_cfg(cfg)
     _set_admit_independent(True)  # reset toggle at entry: never inherit a leaked flag from a prior failed run (Copilot review)
     _input_cell_id = pd.Series(
@@ -1633,21 +1649,21 @@ def run_segmented_pipeline(df: pd.DataFrame,
     #     spanning merges at depth=1.
     # The same G_z drives both Split's grid (where depth=1 is fixed)
     # and Stitch's grid + Δz guard.
-    dz_stats = estimate_within_cell_dz_threshold(df, entity_col="cell_id")
-    auto_dz = dz_stats["threshold"]
-    auto_Gz = dz_stats.get("recommended_G_z", float("nan"))
-    if not np.isfinite(auto_dz):
-        auto_dz, auto_n = None, 0
-        auto_Gz = 1.0
-    if not np.isfinite(auto_Gz):
-        auto_Gz = 1.0
-    import os as _os
-    print("[auto-params] within-cell dz threshold=%s recommended G_z=%s" % (
-             auto_dz, auto_Gz), flush=True)
-    _fgz = _os.environ.get("TRACER_FORCE_AUTO_GZ")   # test hook
-    if _fgz:
-        auto_Gz = float(_fgz)
-        print("[auto-params] FORCED auto_Gz=%s" % auto_Gz, flush=True)
+    if global_params.auto_Gz is not None:
+        # Supplied by the caller (tiled processing): a patch must not
+        # re-estimate this from its own partial data.
+        auto_dz, auto_Gz = None, float(global_params.auto_Gz)
+    else:
+        dz_stats = estimate_within_cell_dz_threshold(df, entity_col="cell_id")
+        auto_dz = dz_stats["threshold"]
+        auto_Gz = dz_stats.get("recommended_G_z", float("nan"))
+        if not np.isfinite(auto_dz):
+            auto_dz, auto_n = None, 0
+            auto_Gz = 1.0
+        if not np.isfinite(auto_Gz):
+            auto_Gz = 1.0
+    _log.info("within-cell dz threshold=%s, recommended G_z=%s%s", auto_dz,
+              auto_Gz, " (supplied)" if global_params.auto_Gz is not None else "")
 
     # Stage 1 — Prune (nuclear-seed when overlaps_nucleus is available).
     # Use PMI column when available; nuclear-seed identity prune
@@ -1832,12 +1848,39 @@ def run_segmented_pipeline(df: pd.DataFrame,
             break
     _set_admit_independent(True)
     _record_stage(progression, "Rescue", df_rescued, "tracer_id")
+    return {
+        "df_rescued": df_rescued, "aux": aux, "cfg": cfg,
+        "progression": progression, "input_cell_id": _input_cell_id,
+        "auto_Gz": auto_Gz,
+    }
+
+
+def segmented_phase_b(state: dict[str, Any],
+                      global_params: Optional[GlobalParams] = None,
+                      ) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+    """Phase B of the segmented workflow: Group -> Mid-QC -> Post-Group Rescue
+    -> Stitch -> Demote -> Final Rescue -> Finalize.
+
+    ``state`` is the dict returned by ``segmented_phase_a`` (its
+    ``df_rescued`` entry is consumed). ``global_params.cascade_thresholds``
+    replaces the data-derived Group-cascade thresholds.
+    """
+    global_params = global_params or GlobalParams()
+    df_rescued = state.pop("df_rescued")
+    aux = state["aux"]
+    cfg = state["cfg"]
+    progression = state["progression"]
+    _input_cell_id = state["input_cell_id"]
+    auto_Gz = state["auto_Gz"]
 
     if PHASE1_SEG_RESIDUAL_CASCADE:
         df_grouped = cascade_as_residual_handler(
             df_pruned=df_rescued, aux=aux,
             entity_col="tracer_id",
-            G=2.0, thresholds="auto",
+            G=2.0,
+            thresholds=(list(global_params.cascade_thresholds)
+                        if global_params.cascade_thresholds is not None
+                        else "auto"),
             territory_radius_bins=1,
             pmi_threshold=PMI_THR,
             min_anchor_tx=3,
@@ -1856,6 +1899,7 @@ def run_segmented_pipeline(df: pd.DataFrame,
             transcript_id_col="transcript_id", show_progress=False,
         )
     _record_stage(progression, "Group", df_grouped, "tracer_id")
+    del df_rescued  # superseded by df_grouped; free it before Mid-QC/Stitch
 
     # Mid-pipeline QC (after Group, before Stitch). Both stages are
     # opt-in via constants at the top of this module.
@@ -1883,22 +1927,6 @@ def run_segmented_pipeline(df: pd.DataFrame,
     # Post-Group Rescue (opt-in). Admits any remaining "-1" tx to
     # Phase-1 entities AND Group components — closing the gap where
     # Group's UNASSIGNED_* couldn't be Rescue targets in the main pass.
-    _perm_seed = _os.environ.get("TRACER_PERMUTE_CASCADE_LABELS")   # test hook
-    if _perm_seed and cfg.rescue.post_group_passes > 0:
-        # Rename cascade_<n>-... partials by a random permutation of n. Pure
-        # renaming: geometry and membership are untouched.
-        _lab = df_grouped["tracer_id"].astype(str)
-        _mm = _lab.str.extract(r"^cascade_(\d+)(-.*)$")
-        _isc = _mm[0].notna()
-        _nn = _mm.loc[_isc, 0].astype(np.int64)
-        _ns = np.unique(_nn.to_numpy())
-        _newn = np.random.default_rng(int(_perm_seed)).permutation(_ns)
-        _map = dict(zip(_ns.tolist(), _newn.tolist()))
-        _lab = _lab.copy()
-        _lab.loc[_isc] = "cascade_" + _nn.map(_map).astype(str) + _mm.loc[_isc, 1]
-        df_grouped = df_grouped.copy()
-        df_grouped["tracer_id"] = _lab.to_numpy()
-        print("[perm-test] renamed %d cascade labels" % len(_ns), flush=True)
     if cfg.rescue.post_group_passes > 0:
         _set_admit_independent(cfg.rescue.admit_independent)
         for _pass in range(cfg.rescue.post_group_passes):
@@ -2021,6 +2049,43 @@ def run_segmented_pipeline(df: pd.DataFrame,
     df_stitched = _canonicalize_output(df_stitched, _input_cell_id)
 
     return df_stitched, progression
+
+
+def run_segmented_pipeline(df: pd.DataFrame,
+                           npmi_panel: pd.DataFrame,
+                           cfg=None,
+                           global_params: Optional[GlobalParams] = None,
+                           ) -> tuple[pd.DataFrame, list[dict[str, Any]]]:
+    """Run the segmented workflow on ``df`` (must have ``cell_id`` set).
+
+    Equivalent to ``segmented_phase_b(segmented_phase_a(...))``; the split
+    exists so tiled processing can save a patch's state between the phases
+    (see ``segmented_phase_a`` / ``segmented_phase_b``).
+
+    Parameters
+    ----------
+    df, npmi_panel
+        Input transcripts (with ``cell_id``) and bootstrap PMI panel.
+    cfg : PipelineConfig | None, optional
+        Phase-B config. When ``None`` (default), a `PipelineConfig` is
+        built from the current module-global constants so today's
+        production behavior is preserved bit-exactly (see
+        `_resolve_pipeline_cfg`). When provided, drives the Rescue,
+        Stitch, Demote, and Final Rescue call sites. Knobs not yet in
+        `PipelineConfig` (Phase-1 prune, Group, post-group-pass-count)
+        continue to read from module globals.
+    global_params : GlobalParams | None, optional
+        Slide-wide values to use instead of deriving them from ``df``.
+
+    Returns
+    -------
+    df_final : DataFrame with a ``tracer_id`` column carrying the final per-tx
+        label (the legacy ``stitched`` column has been dropped / canonicalized
+        to ``tracer_id``).
+    stage_progression : list of state dicts, one per stage.
+    """
+    state = segmented_phase_a(df, npmi_panel, cfg, global_params)
+    return segmented_phase_b(state, global_params)
 
 
 def run_noseg_pipeline(df: pd.DataFrame, npmi_panel: pd.DataFrame,

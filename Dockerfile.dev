@@ -1,0 +1,11 @@
+# Development image: reuse the already-built base image (which has the compiled
+# Cython extensions and all dependencies installed in editable mode under /app)
+# and overlay the Python sources and scripts from this checkout. Rebuilds in
+# seconds, unlike the main Dockerfile, which re-runs apt/pip when any file
+# changes. Does NOT recompile .pyx files: if a .pyx changes, rebuild the base.
+#   docker build -f Dockerfile.dev --build-arg BASE=tracer-local -t tracer-dev .
+ARG BASE=tracer-local
+FROM ${BASE}
+COPY src/tracer/*.py /app/src/tracer/
+COPY src/tracer/configs/ /app/src/tracer/configs/
+COPY scripts/ /app/scripts/

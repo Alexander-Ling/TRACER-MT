@@ -223,7 +223,12 @@ def _rss_gb() -> float:
 # ---------------------------------------------------------------------------
 def load_transcripts(path: Path, log: logging.Logger) -> pd.DataFrame:
     log.info("Loading transcripts: %s", path)
-    df = pd.read_parquet(path)
+    return normalize_transcripts(pd.read_parquet(path), log)
+
+
+def normalize_transcripts(df: pd.DataFrame, log: logging.Logger) -> pd.DataFrame:
+    """Validate required columns and coerce dtypes the way the pipeline
+    expects. Shared by the whole-slide and tiled runners."""
     required = {"x", "y", "feature_name", "cell_id"}
     missing = required - set(df.columns)
     if missing:
@@ -282,12 +287,12 @@ def load_npmi_panel(path: Path, log: logging.Logger) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
-def run_tracer(df: pd.DataFrame, panel: pd.DataFrame, *,
-               platform_name: str, user_config: Path | None,
-               pmi_threshold_override: float | None,
-               g_z_um_override: float | str | None,
-               log: logging.Logger):
-    """Apply config + invoke the canonical SEG pipeline."""
+def build_config(*, platform_name: str, user_config: Path | None,
+                 pmi_threshold_override: float | None,
+                 g_z_um_override: float | str | None,
+                 log: logging.Logger):
+    """Resolve the pipeline config (default < platform preset < user config <
+    CLI overrides) and apply the module-level PMI threshold override."""
     import dataclasses
     from tracer.config import load_config
     import tracer.pipeline as pipeline
@@ -312,6 +317,19 @@ def run_tracer(df: pd.DataFrame, panel: pd.DataFrame, *,
         pipeline.PMI_THR = float(pmi_threshold_override)
         log.info("PMI threshold override: pipeline.PMI_THR = %.4f",
                  pipeline.PMI_THR)
+    return cfg
+
+
+def run_tracer(df: pd.DataFrame, panel: pd.DataFrame, *,
+               platform_name: str, user_config: Path | None,
+               pmi_threshold_override: float | None,
+               g_z_um_override: float | str | None,
+               log: logging.Logger):
+    """Apply config + invoke the canonical SEG pipeline."""
+    import tracer.pipeline as pipeline
+    cfg = build_config(platform_name=platform_name, user_config=user_config,
+                       pmi_threshold_override=pmi_threshold_override,
+                       g_z_um_override=g_z_um_override, log=log)
     log.info("Calling run_segmented_pipeline (df=%d rows, panel=%d pairs)",
              len(df), len(panel))
     os.environ.setdefault("TRACER_STAGE_VERBOSE", "1")
