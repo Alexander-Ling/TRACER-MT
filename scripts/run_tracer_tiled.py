@@ -55,6 +55,7 @@ import pandas as pd         # noqa: E402
 # Peak resident memory of a pipeline run, per million transcripts in the patch
 # (observed: 24M -> ~18 GB, 134M -> >100 GB). Used only to cap concurrency.
 GB_PER_MTX = 0.8
+GB_FIXED = 1.3      # per-worker overhead (interpreter, torch/numba, prior); patient_1 workers peaked at ~1.5 GB on ~0.6M-transcript patches
 THREAD_ENV = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
               "NUMEXPR_NUM_THREADS", "NUMBA_NUM_THREADS", "VECLIB_MAXIMUM_THREADS")
 
@@ -396,7 +397,7 @@ def main(argv=None) -> int:
         pf = _pq.ParquetFile(str(tiling.patch_path(patches, t.tile_id)))
         n_patch_est[t.tile_id] = pf.metadata.num_rows
     order = sorted(n_patch_est, key=lambda k: -n_patch_est[k])
-    biggest_gb = GB_PER_MTX * max(n_patch_est.values()) / 1e6
+    biggest_gb = GB_FIXED + GB_PER_MTX * max(n_patch_est.values()) / 1e6
     mem_cap = max(1, int(args.memory_gb // max(biggest_gb, 0.1)))
     workers = max(1, min(args.workers, mem_cap, len(tiles)))
     log.info("Workers: %d (requested %d; memory cap %d from largest patch %.1f GB "
