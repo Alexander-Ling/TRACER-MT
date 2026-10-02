@@ -51,3 +51,22 @@ strings. Only `--score-mode count` is supported.
 * The halo must exceed the farthest dependency (200 um held on the slides tested;
   see `scripts/validation`). An entity larger than the halo would break exactness.
 * Not exact for the NOSEG pipeline or when the cascade is disabled.
+
+## Validation so far
+Exactness is checked against a whole-slide run made with the same code and seed
+(`scripts/validation`): every pipeline stage, per tile core, as partitions and as
+label strings; then the final transcripts, cell-by-gene counts and scores.
+
+| Slide | Transcripts | Layout | Result vs whole slide |
+|---|---|---|---|
+| patient_1 | 3.4M | 13 tiles, 200 um halo | all 15 stages exact; final outputs identical |
+| 0059267 | 24.2M | 32 tiles, 100 um halo | all 15 stages exact; final outputs identical |
+| 0059267 | 24.2M | 32 tiles, 200 um halo | all 15 stages exact; final outputs identical |
+
+The 100 um and 200 um runs of 0059267 are also identical to each other. scRNA
+prior, seed 1, `stitch.g_z_um = 1.0`.
+
+0059667 (134M transcripts, which was OOM-killed as a whole-slide run) ran tiled
+(128 tiles, 200 um halo, 23 workers) in 38 min with a container peak of 84 GB. It
+has no whole-slide reference, so only structural checks were possible (all rows
+present once, cell count equal to the earlier partial whole-slide run).
