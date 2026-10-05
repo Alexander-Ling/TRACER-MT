@@ -53,8 +53,12 @@ import numpy as np          # noqa: E402
 import pandas as pd         # noqa: E402
 
 # Peak resident memory of a pipeline run, per million transcripts in the patch
-# (observed: 24M -> ~18 GB, 134M -> >100 GB). Used only to cap concurrency.
-GB_PER_MTX = 0.8
+# Used only to cap concurrency. Measured on 27 completed arms plus one OOM-killed
+# arm (14 slides, 0.9-4.4M-transcript patches, 19-23 workers): the container total
+# was at most (GB_FIXED + 0.92 * M_largest_patch) GB per worker, reached by the
+# arm that was OOM-killed at 20 workers on 4.25M-transcript patches. 1.2 leaves
+# about 25% headroom over that.
+GB_PER_MTX = 1.2
 GB_FIXED = 1.3      # per-worker overhead (interpreter, torch/numba, prior); patient_1 workers peaked at ~1.5 GB on ~0.6M-transcript patches
 THREAD_ENV = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
               "NUMEXPR_NUM_THREADS", "NUMBA_NUM_THREADS", "VECLIB_MAXIMUM_THREADS")
